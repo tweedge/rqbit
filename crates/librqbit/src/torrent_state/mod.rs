@@ -285,6 +285,20 @@ impl ManagedTorrent {
         }
     }
 
+    /// Total number of peer entries currently tracked for this torrent.
+    ///
+    /// This counts every peer ever seen while the torrent has been live,
+    /// including peers that are no longer connected: peers are added to the
+    /// map when first seen and are only removed in specific cases, so the
+    /// count grows with peer churn and does not shrink back. Useful for
+    /// monitoring per-torrent memory accumulation.
+    ///
+    /// Returns `None` when the torrent is not live (initializing, paused, or
+    /// errored): the peer map only exists while the torrent is live.
+    pub fn peers_map_len(&self) -> Option<usize> {
+        self.live().map(|live| live.peers_map_len())
+    }
+
     // Get live torrent but wait a bit until it's initialized if it is
     pub(crate) async fn live_wait_initializing(
         &self,

@@ -745,6 +745,15 @@ impl TorrentStateLive {
         }
     }
 
+    /// Total number of peer entries currently tracked, including peers that
+    /// are no longer connected: entries are added when a peer is first seen
+    /// and only removed in specific cases, so the count grows with peer
+    /// churn and does not shrink back. Useful for monitoring per-torrent
+    /// memory accumulation.
+    pub fn peers_map_len(&self) -> usize {
+        self.peers.states.len()
+    }
+
     pub fn per_peer_stats_snapshot(&self, filter: PeerStatsFilter) -> PeerStatsSnapshot {
         PeerStatsSnapshot {
             peers: self

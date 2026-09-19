@@ -377,3 +377,69 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
         info!("all good");
     }
 }
+
+#[tokio::test]
+async fn test_peers_map_len_gauge() {
+    setup_test_logging();
+
+    let tempdir =
+        create_default_random_dir_with_torrents(2, 64 * 1024, Some("rqbit_peers_map_len"));
+    let torrent_file = create_torrent(
+        tempdir.path(),
+        crate::CreateTorrentOptions::default(),
+        &BlockingSpawner::new(1),
+    )
+    .await
+    .unwrap();
+
+    let root = tempfile::TempDir::with_prefix("rqbit_peers_map_len_session").unwrap();
+    let session = Session::new_with_opts(
+        root.path().join("out"),
+        SessionOptions {
+            dht: None,
+            listen: Some(ListenerOptions {
+                listen_addr: ([127, 0, 0, 1], 15190).into(),
+                ..Default::default()
+            }),
+            disable_local_service_discovery: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let handle = session
+        .add_torrent(
+            crate::AddTorrent::TorrentFileBytes(torrent_file.as_bytes().unwrap().clone()),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(tempdir.path().to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+
+    handle.wait_until_initialized().await.unwrap();
+
+    // No peers have connected in this session, but the gauge must be
+    // readable and finite: the map exists while the torrent is live.
+    let len = handle
+        .peers_map_len()
+        .expect("live torrent must expose the peers map length");
+    assert!(len < 10_000, "implausible peers map length: {len}");
+
+    // The peer map only exists while the torrent is live; pausing drops it.
+    session.pause(&handle).await.unwrap();
+    assert_eq!(
+        handle.peers_map_len(),
+        None,
+        "paused torrent has no peers map"
+    );
+
+    drop(handle);
+    drop(session);
+    wait_until_i_am_the_last_task().await.unwrap();
+}
