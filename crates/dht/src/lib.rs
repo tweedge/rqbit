@@ -20,10 +20,17 @@ pub type Dht = Arc<DhtState>;
 
 // How long do we wait for a response from a DHT node.
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-// TODO: Not sure if we should re-query tbh.
-pub(crate) const REQUERY_INTERVAL: Duration = Duration::from_secs(60);
 // After how long we consider a routing table node questionable.
 pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// How often each torrent's DHT lookup pass is re-run.
+pub(crate) const LOOKUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// Maximum number of in-flight DHT requests per torrent lookup pass. This is
+// the backpressure point that bounds memory: each queued request is a future
+// waiting on a response.
+pub(crate) const LOOKUP_MAX_INFLIGHT: usize = 16;
+// Hard cap on requests sent per torrent lookup pass. Passes normally converge
+// before hitting this; it bounds adversarial swarms.
+pub(crate) const LOOKUP_MAX_REQUESTS: usize = 256;
 
 pub struct DhtBuilder {}
 

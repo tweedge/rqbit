@@ -11,7 +11,8 @@ use std::{
 };
 
 use crate::{
-    Error, INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
+    Error, INACTIVITY_TIMEOUT, LOOKUP_INTERVAL, LOOKUP_MAX_INFLIGHT, LOOKUP_MAX_REQUESTS,
+    RESPONSE_TIMEOUT,
     bprotocol::{
         self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
@@ -225,7 +226,7 @@ impl RequestPeersStream {
                     announce_port,
                 },
             });
-            rp.request_peers_forever(node_rx, is_v4)
+            rp.spawn_lookup_task(node_rx, is_v4)
         };
 
         let v4 = make(true, dht.clone(), peer_tx.clone());
@@ -336,55 +337,94 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
 }
 
 impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
-    fn request_peers_forever(
+    /// Runs one bounded, terminating traversal pass: at most
+    /// `lookup_max_inflight` requests in flight, at most `lookup_max_requests`
+    /// sent, ending on Kademlia convergence (nothing in flight, no candidates
+    /// queued) or budget exhaustion (queued candidates persist for the next
+    /// pass, which processes them first).
+    async fn run_lookup_pass(
+        &self,
+        node_rx: &mut UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
+    ) {
+        let mut futs = FuturesUnordered::new();
+        let max_inflight = self.dht.lookup_max_inflight.max(1);
+        let mut budget = self.dht.lookup_max_requests.max(1);
+        loop {
+            while futs.len() >= max_inflight {
+                if futs.next().await.is_none() {
+                    break;
+                }
+            }
+            if budget == 0 {
+                while futs.next().await.is_some() {}
+                break;
+            }
+            if futs.is_empty() && node_rx.is_empty() {
+                break;
+            }
+            tokio::select! {
+                biased;
+
+                item = node_rx.recv() => match item {
+                    Some((id, addr, depth)) => {
+                        budget -= 1;
+                        futs.push(
+                            self.request_one(id, addr, depth)
+                                .map_err(|e| debug!("error: {e:#}"))
+                                .instrument(debug_span!("addr", addr=addr.to_string()))
+                        );
+                    }
+                    None => {
+                        while futs.next().await.is_some() {}
+                        break;
+                    }
+                },
+                Some(_) = futs.next(), if !futs.is_empty() => {}
+            }
+        }
+    }
+
+    /// Per-torrent lookup task: run a bounded terminating traversal pass, then
+    /// sleep out the rest of the announce interval. Teardown is by task abort
+    /// when the consumer drops the stream.
+    fn spawn_lookup_task(
         self: &Arc<Self>,
-        mut node_rx: tokio::sync::mpsc::UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
+        mut node_rx: UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
         is_v4: bool,
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
-        spawn(
+        spawn::<crate::Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
             "get_peers",
             async move {
                 let this = &this;
-                // Looper adds root nodes to the queue every 60 seconds.
-                let looper = {
-                    async move {
-                        let mut iteration = 0;
-                        loop {
-                            trace!("iteration {}", iteration);
-                            let sleep = match this.get_peers_root(is_v4) {
-                                Ok(0) => Duration::from_secs(1),
-                                Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
-                                Ok(_) => REQUERY_INTERVAL,
-                                Err(e) => {
-                                    error!("dht: error in get_peers_root(): {e:#}");
-                                    return Err::<(), crate::Error>(e);
-                                }
-                            };
-                            tokio::time::sleep(sleep).await;
-                            iteration += 1;
-                        }
-                    }
-                };
-                tokio::pin!(looper);
-
-                let mut futs = FuturesUnordered::new();
                 loop {
-                    tokio::select! {
-                        addr = node_rx.recv() => {
-                            let (id, addr, depth) = addr.unwrap();
-                            futs.push(
-                                this.request_one(id, addr, depth)
-                                    .map_err(|e| debug!("error: {e:#}"))
-                                    .instrument(debug_span!("addr", addr=addr.to_string()))
-                            );
+                    let pass_started = Instant::now();
+                    let roots = match this.get_peers_root(is_v4) {
+                        Ok(0) => {
+                            // Routing table empty (e.g. still bootstrapping),
+                            // no queries sent - retry soon.
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
                         }
-                        Some(_) = futs.next(), if !futs.is_empty() => {}
-                        r = &mut looper => {
-                            return r
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("dht: error in get_peers_root(): {e:#}");
+                            tokio::time::sleep(this.dht.lookup_interval).await;
+                            continue;
                         }
-                    }
+                    };
+                    this.run_lookup_pass(&mut node_rx).await;
+                    // Warm-up: re-query proportionally sooner while the routing table has
+                    // fewer than 8 usable nodes, as the old loop did.
+                    let cadence = if roots < 8 {
+                        (this.dht.lookup_interval / 8)
+                            .saturating_mul(roots as u32)
+                            .max(Duration::from_secs(1))
+                    } else {
+                        this.dht.lookup_interval
+                    };
+                    tokio::time::sleep(cadence.saturating_sub(pass_started.elapsed())).await;
                 }
             },
         )
@@ -590,9 +630,14 @@ pub struct DhtState {
     cancellation_token: CancellationToken,
 
     pub(crate) peer_store: PeerStore,
+
+    lookup_interval: Duration,
+    lookup_max_inflight: usize,
+    lookup_max_requests: usize,
 }
 
 impl DhtState {
+    #[allow(clippy::too_many_arguments)]
     fn new_internal(
         id: Id20,
         sender: UnboundedSender<WorkerSendRequest>,
@@ -601,6 +646,7 @@ impl DhtState {
         listen_addr: SocketAddr,
         peer_store: PeerStore,
         cancellation_token: CancellationToken,
+        lookup: LookupTuning,
     ) -> Self {
         let routing_table_v4 = routing_table_v4.unwrap_or_else(|| RoutingTable::new(id, None));
         let routing_table_v6 = routing_table_v6.unwrap_or_else(|| RoutingTable::new(id, None));
@@ -615,6 +661,9 @@ impl DhtState {
             rate_limiter: make_rate_limiter(),
             peer_store,
             cancellation_token,
+            lookup_interval: lookup.interval,
+            lookup_max_inflight: lookup.max_inflight.max(1),
+            lookup_max_requests: lookup.max_requests.max(1),
         }
     }
 
@@ -1283,6 +1332,36 @@ pub struct DhtConfig<'a> {
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
+    /// How often each torrent's DHT lookup pass re-runs
+    /// (default [`crate::LOOKUP_INTERVAL`]).
+    pub lookup_interval: Option<Duration>,
+    /// Maximum in-flight DHT requests per torrent lookup pass
+    /// (default [`crate::LOOKUP_MAX_INFLIGHT`]).
+    pub lookup_max_inflight: Option<usize>,
+    /// Hard cap on requests sent per torrent lookup pass
+    /// (default [`crate::LOOKUP_MAX_REQUESTS`]).
+    pub lookup_max_requests: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct LookupTuning {
+    interval: Duration,
+    max_inflight: usize,
+    max_requests: usize,
+}
+
+impl LookupTuning {
+    fn from_config(config: &DhtConfig) -> Self {
+        Self {
+            interval: config
+                .lookup_interval
+                .unwrap_or(LOOKUP_INTERVAL)
+                // Floor at 1s: sub-second intervals monopolize the rate limiter.
+                .max(Duration::from_secs(1)),
+            max_inflight: config.lookup_max_inflight.unwrap_or(LOOKUP_MAX_INFLIGHT),
+            max_requests: config.lookup_max_requests.unwrap_or(LOOKUP_MAX_REQUESTS),
+        }
+    }
 }
 
 impl DhtState {
@@ -1316,6 +1395,7 @@ impl DhtState {
                 .peer_id
                 .unwrap_or_else(|| generate_azereus_style(*b"rQ", crate_version!()));
             info!("starting up DHT with peer id {:?}", peer_id);
+            let lookup = LookupTuning::from_config(&config);
             let bootstrap_addrs = config
                 .bootstrap_addrs
                 .unwrap_or_else(|| crate::DHT_BOOTSTRAP.iter().map(|v| v.to_string()).collect());
@@ -1331,6 +1411,7 @@ impl DhtState {
                 listen_addr,
                 config.peer_store.unwrap_or_else(|| PeerStore::new(peer_id)),
                 token,
+                lookup,
             ));
 
             spawn_with_cancel(
@@ -1394,5 +1475,286 @@ impl FromSocketAddr for SocketAddrV6 {
             SocketAddr::V6(a) => Some(a),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DhtBuilder;
+    use crate::bprotocol::{self, CompactNodeInfo, MessageKind, Node, Response};
+    use bencode::ByteBufOwned;
+    use futures::StreamExt;
+    use librqbit_core::compact_ip::CompactSocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    const INFO_HASH: [u8; 20] = [0xABu8; 20];
+    // Node id prefix equal to the info hash's first two bytes, so that swarm
+    // nodes are within min_distance_to_announce and announce_peer gets used.
+    const ID_PREFIX: [u8; 2] = [0xAB, 0xAB];
+
+    #[derive(Default)]
+    struct SwarmCounters {
+        get_peers_queries: AtomicU64,
+        announce_queries: AtomicU64,
+        inflight: AtomicUsize,
+        max_inflight: AtomicU64,
+    }
+
+    struct Swarm {
+        addrs: Vec<SocketAddr>,
+    }
+
+    // Spawns `n` responsive swarm nodes sharing `counters`. If
+    // `fresh_unresponsive` is set, each get_peers response also includes that
+    // many unique unreachable addresses (requests to them time out).
+    async fn spawn_swarm(
+        counters: Arc<SwarmCounters>,
+        n: usize,
+        respond_delay: Duration,
+        fresh_unresponsive: usize,
+    ) -> Swarm {
+        let mut sockets = Vec::with_capacity(n);
+        let mut addrs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(sock.local_addr().unwrap());
+            sockets.push(sock);
+        }
+        for sock in sockets.into_iter() {
+            let counters = counters.clone();
+            let known_addrs = addrs.clone();
+            tokio::spawn(swarm_node_task(
+                sock,
+                known_addrs,
+                counters,
+                respond_delay,
+                fresh_unresponsive,
+            ));
+        }
+        Swarm { addrs }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn swarm_node_task(
+        sock: tokio::net::UdpSocket,
+        known_addrs: Vec<SocketAddr>,
+        counters: Arc<SwarmCounters>,
+        respond_delay: Duration,
+        fresh_unresponsive: usize,
+    ) {
+        let my_index = known_addrs
+            .iter()
+            .position(|a| *a == sock.local_addr().unwrap())
+            .unwrap_or(0) as u16;
+        let my_id = node_id(my_index);
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, from) = match sock.recv_from(&mut buf).await {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let msg = match bprotocol::deserialize_message::<ByteBufOwned>(&buf[..n]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let inflight = counters.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            counters
+                .max_inflight
+                .fetch_max(inflight as u64, Ordering::SeqCst);
+            tokio::time::sleep(respond_delay).await;
+
+            let response = match &msg.kind {
+                MessageKind::GetPeersRequest(_) => {
+                    counters.get_peers_queries.fetch_add(1, Ordering::SeqCst);
+                    let mut nodes = Vec::new();
+                    for i in 0..fresh_unresponsive {
+                        let mut id = [0u8; 20];
+                        id[..2].copy_from_slice(&INFO_HASH[..2]);
+                        id[2..6].copy_from_slice(&(i as u32).to_be_bytes());
+                        id[6..10].copy_from_slice(
+                            &(counters.get_peers_queries.load(Ordering::SeqCst) as u32)
+                                .to_be_bytes(),
+                        );
+                        let octet = (i * 7 % 250 + 1) as u8;
+                        nodes.push(Node {
+                            id: Id20::new(id),
+                            addr: SocketAddrV4::new(Ipv4Addr::new(10, 200, 0, octet), 9),
+                        });
+                    }
+                    for (j, a) in known_addrs.iter().take(3).enumerate() {
+                        if let SocketAddr::V4(a4) = a {
+                            nodes.push(Node {
+                                id: node_id(j as u16),
+                                addr: *a4,
+                            });
+                        }
+                    }
+                    MessageKind::Response(Response {
+                        id: my_id,
+                        token: Some(ByteBufOwned::from(b"aaaa".as_ref())),
+                        nodes: Some(CompactNodeInfo::new_from_iter(nodes.into_iter())),
+                        nodes6: None,
+                        values: Some(vec![CompactSocketAddr::from(SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            30000,
+                        ))]),
+                    })
+                }
+                MessageKind::FindNodeRequest(_) => {
+                    let mut nodes = Vec::new();
+                    for (j, a) in known_addrs.iter().take(3).enumerate() {
+                        if let SocketAddr::V4(a4) = a {
+                            nodes.push(Node {
+                                id: node_id(j as u16),
+                                addr: *a4,
+                            });
+                        }
+                    }
+                    MessageKind::Response(Response {
+                        id: my_id,
+                        token: Some(ByteBufOwned::from(b"aaaa".as_ref())),
+                        nodes: Some(CompactNodeInfo::new_from_iter(nodes.into_iter())),
+                        nodes6: None,
+                        values: None,
+                    })
+                }
+                MessageKind::PingRequest(_) => MessageKind::Response(Response {
+                    id: my_id,
+                    ..Default::default()
+                }),
+                MessageKind::AnnouncePeer(_) => {
+                    counters.announce_queries.fetch_add(1, Ordering::SeqCst);
+                    MessageKind::Response(Response {
+                        id: my_id,
+                        ..Default::default()
+                    })
+                }
+                _ => continue,
+            };
+            counters.inflight.fetch_sub(1, Ordering::SeqCst);
+            let mut out = Vec::new();
+            bprotocol::serialize_message(
+                &mut out,
+                msg.transaction_id.clone(),
+                msg.version.clone(),
+                msg.ip,
+                response,
+            )
+            .unwrap();
+            let _ = sock.send_to(&out, from).await;
+        }
+    }
+
+    fn node_id(j: u16) -> Id20 {
+        let mut id = [0u8; 20];
+        id[..2].copy_from_slice(&ID_PREFIX);
+        id[2..4].copy_from_slice(&j.to_be_bytes());
+        Id20::new(id)
+    }
+
+    async fn wait_for_routing_table(dht: &DhtState, min_nodes: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if dht.stats().routing_table_size >= min_nodes {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("routing table never filled");
+    }
+
+    #[tokio::test]
+    async fn get_peers_lookups_are_periodic_bounded_and_announce() {
+        let counters = Arc::new(SwarmCounters::default());
+        let swarm = spawn_swarm(counters.clone(), 4, Duration::from_millis(2), 0).await;
+        let dht = DhtBuilder::with_config(DhtConfig {
+            bootstrap_addrs: Some(vec![swarm.addrs[0].to_string()]),
+            listen_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            lookup_interval: Some(Duration::from_secs(1)),
+            lookup_max_inflight: Some(4),
+            lookup_max_requests: Some(32),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_for_routing_table(&dht, 2).await;
+
+        let info_hash = Id20::new(INFO_HASH);
+        let mut peer_rx = dht.get_peers(info_hash, Some(12345));
+
+        // Collect peers for ~2s, covering ~2 passes at the 1s interval.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut peers = 0;
+        while Instant::now() < deadline {
+            if tokio::time::timeout(Duration::from_millis(50), peer_rx.next())
+                .await
+                .is_ok()
+            {
+                peers += 1;
+            }
+        }
+
+        let queries = counters.get_peers_queries.load(Ordering::SeqCst);
+        let announces = counters.announce_queries.load(Ordering::SeqCst);
+        let max_inflight = counters.max_inflight.load(Ordering::SeqCst);
+
+        assert!(peers >= 10, "expected peers across passes, got {peers}");
+        assert!(
+            announces > 0,
+            "expected announce_peer to be sent for close nodes"
+        );
+        assert!(
+            max_inflight <= 4,
+            "swarm observed {max_inflight} concurrent requests, cap is 4"
+        );
+        // ~2 passes expected in 2s at the 1s interval; each pass queries at most 8
+        // roots (responses only return already-known nodes), so allow generous
+        // slack, but far below any runaway growth.
+        assert!(
+            queries <= 6 * 32,
+            "expected bounded queries per pass, got {queries} in ~2s"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn get_peers_pass_terminates_despite_unresponsive_nodes() {
+        let counters = Arc::new(SwarmCounters::default());
+        let swarm = spawn_swarm(counters.clone(), 1, Duration::from_millis(2), 2).await;
+        let dht = DhtBuilder::with_config(DhtConfig {
+            bootstrap_addrs: Some(vec![swarm.addrs[0].to_string()]),
+            listen_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            lookup_interval: Some(Duration::from_secs(1)),
+            lookup_max_inflight: Some(2),
+            lookup_max_requests: Some(8),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_for_routing_table(&dht, 1).await;
+
+        let info_hash = Id20::new(INFO_HASH);
+        let peer_rx = dht.get_peers(info_hash, None);
+        // Virtual time auto-advances when idle, so request timeouts resolve
+        // instantly; run 60 virtual seconds and drop the stream.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(peer_rx);
+
+        let queries = counters.get_peers_queries.load(Ordering::SeqCst);
+        // Each pass dequeues at most `lookup_max_requests` (8) candidates, so
+        // queries reaching the live node stay bounded; these assertions prove
+        // the task keeps cycling passes without a runaway query rate.
+        assert!(
+            queries > 10,
+            "expected the lookup task to keep running periodic passes"
+        );
+        assert!(
+            queries <= 60 * 8,
+            "expected bounded queries across ~60 passes, got {queries}"
+        );
     }
 }
